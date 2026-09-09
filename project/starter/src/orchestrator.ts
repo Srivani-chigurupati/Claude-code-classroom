@@ -374,6 +374,25 @@ export class CodeReviewOrchestrator {
 
     const parsed = ReviewReportSchema.safeParse(draft);
 
+    if (parsed.success && parsed.data.fileReviews.length === 0) {
+      // The agent is allowed to return an empty fileReviews array, and it does
+      // so both when the PR genuinely has nothing reviewable AND when it could
+      // not fetch the PR at all. Either way there is no review here, so refuse
+      // to hand back a zero-score report that looks like a successful run.
+      const why = parsed.data.recommendations
+        .map((r) => r.description)
+        .join(' ')
+        .slice(0, 400);
+      throw new ReviewError(
+        `No files were reviewed for ${owner}/${repo}#${prNumber}. Either the pull ` +
+          'request could not be fetched (private repo without GITHUB_TOKEN, wrong ' +
+          'owner/repo, or no such PR number) or it changed no reviewable source ' +
+          `files.${why ? ` Agent reported: ${why}` : ''}`,
+        ErrorCodes.PR_NOT_FOUND,
+        { owner, repo, prNumber }
+      );
+    }
+
     if (!parsed.success) {
       const issues = parsed.error.errors
         .map((issue) => `${issue.path.join('.') || '<root>'}: ${issue.message}`)

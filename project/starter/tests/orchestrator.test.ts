@@ -349,6 +349,44 @@ describe('CodeReviewOrchestrator', () => {
       ).rejects.toMatchObject({ code: ErrorCodes.VALIDATION_FAILED });
     });
 
+    it('refuses an empty report instead of reporting success with score 0', async () => {
+      // What a failed PR fetch actually produces: schema-valid, zero files.
+      mockedQuery.mockImplementation(
+        fakeStream({
+          pullRequest: { owner: 'airaamane', repo: 'simple-todo-app', number: 1 },
+          fileReviews: [],
+          summary: {
+            totalFiles: 0,
+            overallScore: 0,
+            criticalIssues: 0,
+            highPriorityTests: 0,
+            refactoringOpportunities: 0
+          },
+          recommendations: [
+            {
+              priority: 'critical',
+              category: 'Data Retrieval',
+              description: 'Failed to fetch pull request #1.',
+              files: []
+            }
+          ],
+          metadata: {
+            analyzedAt: '2026-01-01T00:00:00.000Z',
+            duration: 0,
+            agentVersions: { x: '1.0.0' }
+          }
+        }) as never
+      );
+
+      await expect(
+        new CodeReviewOrchestrator({ maxRetries: 1 }).reviewPullRequest(
+          'airaamane',
+          'simple-todo-app',
+          1
+        )
+      ).rejects.toMatchObject({ code: ErrorCodes.PR_NOT_FOUND });
+    });
+
     it('fails fast when an MCP server does not connect', async () => {
       mockedQuery.mockImplementation(
         fakeStream(structuredReport(), { mcpFailed: 'github' }) as never

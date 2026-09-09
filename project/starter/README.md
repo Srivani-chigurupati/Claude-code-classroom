@@ -104,7 +104,7 @@ Structured logs go to `logs/combined.log` and `logs/error.log`.
 ## Testing
 
 ```bash
-npm test          # 99 tests, no API key or network required
+npm test          # 100 tests, no API key or network required
 npm run lint      # tsc --noEmit
 npm run build
 ```
@@ -139,17 +139,28 @@ covered offline. The one live integration test is `it.skip`-ped by design.
 ## Deliverable status
 
 Phases 1-5 are complete and verified: `npm run lint`, `npm run build` and
-`npm test` (99 passing) are clean, and both MCP servers complete a stdio
+`npm test` (100 passing) are clean, and both MCP servers complete a stdio
 handshake.
 
-Phase 6 is **not** complete. The nine report files for
-`airaamane/simple-todo-app` PRs 1-3 require a live Anthropic API key, which was
-not available in the environment where this was built. To produce them:
+Task 5.2 (live integration test) passes against a real PR:
 
-```bash
-npm run dev -- airaamane simple-todo-app 1
-npm run dev -- airaamane simple-todo-app 2
-npm run dev -- airaamane simple-todo-app 3
+```
+npm run dev -- octocat Hello-World 1
+-> 96.5s, score 79/100, 3 subagents invoked, 3 report files written
 ```
 
-That yields all nine files in `reports/`.
+Phase 6 is **not** complete, and not for want of an API key. The test
+repository is unreachable:
+
+```
+GET /repos/airaamane/simple-todo-app  -> 404 Not Found
+GET /users/airaamane                  -> 200, public_repos: 0
+```
+
+The account exists but has no public repositories, so the repo is private and
+an unauthenticated request cannot see it. Set a `GITHUB_TOKEN` with read access
+to it in `.env`, then run the three commands in `reports/README.md` to produce
+all nine files.
+
+A failed PR fetch is reported as a `PR_NOT_FOUND` error and writes no report -
+an empty, zero-score report is never presented as a successful review.
