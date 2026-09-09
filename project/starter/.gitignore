@@ -9,4 +9,5 @@ logs/
 coverage/
 *.tsbuildinfo
 .temp/
-reports/
+# reports/ is NOT ignored: the nine generated PR reports are a required
+# submission deliverable (Instructions 2, Task 6.4).

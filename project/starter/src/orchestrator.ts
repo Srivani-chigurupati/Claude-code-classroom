@@ -15,6 +15,15 @@ import {
   hasGitHubToken
 } from './config/mcp.config.js';
 import { logger } from './utils/logger.js';
+import { RateLimiter } from './utils/rate-limiter.js';
+import type { RateLimiterConfig } from './utils/rate-limiter.js';
+import {
+  ReviewError,
+  ErrorCodes,
+  withRetry,
+  withTimeout,
+  formatError
+} from './utils/error-handler.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -43,6 +52,19 @@ export interface OrchestratorOptions {
   maxFiles?: number;
   /** Override the subagent registry (tests inject fakes here). */
   agents?: Record<string, AgentDefinition>;
+  /** Rate limits for the Anthropic API. Merged over DEFAULT_RATE_LIMITS. */
+  rateLimits?: Partial<RateLimiterConfig>;
+  /**
+   * Attempts for the whole review. Kept low on purpose: a retry re-runs every
+   * subagent, so it costs a full review each time.
+   */
+  maxRetries?: number;
+  /** Base backoff between retries, doubled per attempt. */
+  retryDelayMs?: number;
+  /** Wall-clock budget for one review attempt. */
+  timeoutMs?: number;
+  /** Tokens charged against the rate limiter for one review. */
+  estimatedTokens?: number;
 }
 
 /** Shape we read off the SDK message stream. */
@@ -83,6 +105,11 @@ export class CodeReviewOrchestrator {
   private readonly projectRoot: string;
   private readonly maxFiles: number;
   private readonly agents: Record<string, AgentDefinition>;
+  private readonly maxRetries: number;
+  private readonly retryDelayMs: number;
+  private readonly timeoutMs: number;
+  private readonly estimatedTokens: number;
+  private readonly rateLimiter: RateLimiter;
 
   constructor(options: OrchestratorOptions = {}) {
     const model = options.model ?? process.env.ANTHROPIC_MODEL;
@@ -99,6 +126,16 @@ export class CodeReviewOrchestrator {
     this.projectRoot = options.projectRoot ?? DEFAULT_PROJECT_ROOT;
     this.maxFiles = options.maxFiles ?? 5;
     this.agents = options.agents ?? subagents;
+    this.maxRetries = options.maxRetries ?? 2;
+    this.retryDelayMs = options.retryDelayMs ?? 2000;
+    this.timeoutMs = options.timeoutMs ?? 15 * 60 * 1000;
+    this.estimatedTokens = options.estimatedTokens ?? 50_000;
+    this.rateLimiter = new RateLimiter(options.rateLimits ?? {});
+  }
+
+  /** Current rate limiter state - useful for logging and for tests. */
+  getRateLimiterStatus(): ReturnType<RateLimiter['getStatus']> {
+    return this.rateLimiter.getStatus();
   }
 
   /**
@@ -120,6 +157,50 @@ export class CodeReviewOrchestrator {
     }
 
     logger.info('Starting code review', { owner, repo, prNumber, model: this.model });
+
+    // Rate limit first, so a burst of reviews queues instead of being throttled
+    // by the API. release() must run even if the review throws, or the
+    // concurrency slot leaks and later calls block forever.
+    await this.rateLimiter.acquire(this.estimatedTokens);
+    logger.debug('Rate limiter acquired', this.rateLimiter.getStatus());
+
+    try {
+      // Retry the whole attempt on transient failures (MCP start-up, network,
+      // a 529 from the API), with a wall-clock cap on each attempt so a hung
+      // subagent cannot stall the run indefinitely.
+      return await withRetry(
+        () =>
+          withTimeout(
+            () => this.runReviewAttempt(owner, repo, prNumber),
+            this.timeoutMs,
+            `Code review of ${owner}/${repo}#${prNumber} exceeded ${this.timeoutMs}ms`
+          ),
+        this.maxRetries,
+        this.retryDelayMs,
+        isTransient
+      );
+    } catch (error) {
+      logger.error('Code review failed', {
+        owner,
+        repo,
+        prNumber,
+        error: formatError(error)
+      });
+      throw error;
+    } finally {
+      this.rateLimiter.release();
+    }
+  }
+
+  /**
+   * One attempt at a full review: run the orchestrator query, then validate and
+   * finalize its structured output.
+   */
+  private async runReviewAttempt(
+    owner: string,
+    repo: string,
+    prNumber: number
+  ): Promise<ReviewReport> {
     const startedAt = Date.now();
 
     const prompt = buildOrchestratorPrompt({
@@ -190,17 +271,27 @@ export class CodeReviewOrchestrator {
       }
 
       if (message.subtype === 'error_max_structured_output_retries') {
-        throw new Error(
+        throw new ReviewError(
           'The agent could not produce output matching ReviewReportSchema after the maximum retries. ' +
-            'Check that the orchestrator prompt still describes every required field.'
+            'Check that the orchestrator prompt still describes every required field.',
+          ErrorCodes.STRUCTURED_OUTPUT_FAILED,
+          { owner, repo, prNumber }
         );
       }
 
-      throw new Error(`Code review failed: ${message.subtype ?? 'unknown result'}`);
+      throw new ReviewError(
+        `Code review failed: ${message.subtype ?? 'unknown result'}`,
+        ErrorCodes.AGENT_FAILED,
+        { owner, repo, prNumber, subtype: message.subtype }
+      );
     }
 
     if (structuredOutput === undefined) {
-      throw new Error('The agent stream ended without returning structured output.');
+      throw new ReviewError(
+        'The agent stream ended without returning structured output.',
+        ErrorCodes.STRUCTURED_OUTPUT_FAILED,
+        { owner, repo, prNumber }
+      );
     }
 
     const report = this.finalizeReport(structuredOutput, owner, repo, prNumber, startedAt);
@@ -225,9 +316,11 @@ export class CodeReviewOrchestrator {
     for (const server of message.mcp_servers ?? []) {
       logger.debug('MCP server status', { server: server.name, status: server.status });
       if (server.status === 'failed') {
-        throw new Error(
+        throw new ReviewError(
           `MCP server '${server.name}' failed to connect. Check the package name in ` +
-            'src/config/mcp.config.ts, that npx is on PATH, and that required env vars are set.'
+            'src/config/mcp.config.ts, that npx is on PATH, and that required env vars are set.',
+          ErrorCodes.INVALID_CONFIG,
+          { server: server.name }
         );
       }
     }
@@ -286,7 +379,11 @@ export class CodeReviewOrchestrator {
         .map((issue) => `${issue.path.join('.') || '<root>'}: ${issue.message}`)
         .join('; ');
       logger.error('Report validation failed', { issues });
-      throw new Error(`Report validation failed - ${issues}`);
+      throw new ReviewError(
+        `Report validation failed - ${issues}`,
+        ErrorCodes.VALIDATION_FAILED,
+        { issues }
+      );
     }
 
     return {
@@ -294,6 +391,33 @@ export class CodeReviewOrchestrator {
       summary: recomputeSummary(parsed.data.fileReviews)
     };
   }
+}
+
+/**
+ * Error codes that will fail the same way on a second attempt, so retrying them
+ * just burns another full multi-agent review.
+ */
+const NON_RETRYABLE: ReadonlySet<string> = new Set([
+  ErrorCodes.VALIDATION_FAILED,
+  ErrorCodes.STRUCTURED_OUTPUT_FAILED,
+  ErrorCodes.INVALID_CONFIG,
+  ErrorCodes.MISSING_API_KEY,
+  ErrorCodes.PR_NOT_FOUND,
+  ErrorCodes.AGENT_FAILED,
+  // A timeout means the attempt already consumed its whole wall-clock budget.
+  ErrorCodes.AGENT_TIMEOUT
+]);
+
+/**
+ * Retry only failures that plausibly clear on their own - network blips, MCP
+ * start-up races, API overload. Anything we recognise as deterministic is
+ * rethrown immediately with its own error code intact.
+ */
+function isTransient(error: unknown): boolean {
+  if (error instanceof ReviewError) {
+    return !NON_RETRYABLE.has(error.code);
+  }
+  return true;
 }
 
 /**

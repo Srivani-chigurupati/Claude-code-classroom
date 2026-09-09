@@ -1,192 +1,155 @@
 # Enterprise Multi-Agent Code Review Orchestrator
 
-Build a production-ready multi-agent system that automates code review using the Claude Agent SDK.
+A multi-agent system that reviews GitHub pull requests using the Claude Agent
+SDK. A main orchestrator fetches the PR through the GitHub MCP server, delegates
+each changed file to three specialized subagents in parallel, and aggregates
+their findings into one schema-validated report rendered as Markdown, HTML and
+JSON.
 
-## Project Overview
+## Architecture
 
-This system uses multiple specialized AI agents working together to provide comprehensive code reviews:
+```
+main.ts  (CLI: arg + auth + model validation, report writing)
+   |
+   v
+CodeReviewOrchestrator            rate limiter -> retry -> timeout
+   |  query() with allowedTools ['Task', ...mcp tools, ...subagent tools]
+   |  outputFormat: json_schema from ReviewReportSchema
+   |
+   +-- GitHub MCP ---- get_pull_request, get_pull_request_files
+   |
+   +-- Task --> code-quality-analyzer   security / perf / bug-risk (+ Skill)
+   +-- Task --> test-coverage-analyzer  coverage gaps + concrete test cases
+   +-- Task --> refactoring-suggester   before/after structural improvements
+   |
+   v
+ReviewReport  -> Zod safeParse -> reports/<owner>_<repo>_<pr>.{json,md,html}
+```
 
-- **Main Orchestrator** - Coordinates the review process and aggregates results
-- **Code Quality Analyzer** - Identifies code smells, anti-patterns, and best practice violations
-- **Test Coverage Analyzer** - Evaluates test completeness and suggests missing test cases
-- **Refactoring Suggester** - Recommends architectural improvements and refactoring opportunities
+Each file's three subagents are invoked in a single message so they run
+concurrently. The orchestrator never analyzes code itself.
 
-## What's Provided
+## Layout
 
-This starter includes the infrastructure you need:
+```
+src/
+  agents/      three AgentDefinitions + the registry handed to the SDK
+  prompts/     one prompt per agent, plus the orchestrator prompt builder
+  config/      MCP server configuration (GitHub, ESLint)
+  types/       Zod schemas and their JSON Schema exports
+  utils/       logger, report generator, error handler, rate limiter
+  orchestrator.ts
+  main.ts
+tests/         schemas, utils, orchestrator (SDK mocked - no API key needed)
+.claude/skills/  security-analysis, javascript-best-practices,
+                 code-review-best-practices
+```
 
-- **Type Definitions** (`src/types/`) - Zod schemas for validation
-- **Logger** (`src/utils/logger.ts`) - Winston structured logging
-- **Report Generator** (`src/utils/report-generator.ts`) - Markdown/HTML/JSON report generation
-- **Project Config** - `package.json`, `tsconfig.json`, `.env.example`
-- **Test Skeletons** (`tests/`) - Test file structure
-- **Example Skill** (`.claude/skills/`) - Sample Claude skill
+## Setup
 
-## What You Need to Implement
-
-Your tasks:
-
-1. **Agent Definitions** (`src/agents/`)
-   - Code Quality Analyzer
-   - Test Coverage Analyzer
-   - Refactoring Suggester
-
-2. **Prompts** (`src/prompts/`)
-   - Orchestrator prompt
-   - Agent-specific prompts
-
-3. **MCP Configuration** (`src/config/mcp.config.ts`)
-   - GitHub MCP server
-   - ESLint MCP server
-
-4. **Orchestrator** (`src/orchestrator.ts`)
-   - Main coordination logic
-   - Agent spawning and result aggregation
-
-5. **Main Entry Point** (`src/main.ts`)
-   - CLI argument parsing
-   - Environment validation
-   - Report generation
-
-6. **Error Handler** (Recommended) (`src/utils/error-handler.ts`)
-   - Custom `ReviewError` class
-   - Retry logic with exponential backoff
-   - Timeout wrapper
-
-7. **Rate Limiter** (Optional) (`src/utils/rate-limiter.ts`)
-   - Token bucket algorithm with sliding window
-   - Request and token tracking
-   - Concurrent request management
-
-## Getting Started
-
-### Prerequisites
-
-- Node.js 18+
-- Anthropic API access (provided in Vocareum workspace) or [your own API key](https://console.anthropic.com/)
-- [GitHub Personal Access Token](https://github.com/settings/tokens) (recommended - scopes: `repo`, `read:org`)
-
-### Installation
-
-**In Vocareum Workspace (Recommended):**
-
-Your workspace comes pre-configured with Anthropic API credentials.
+Requires Node.js 18+.
 
 ```bash
-# Install dependencies from repository root (uses npm workspaces)
-cd /voc/work/cd14715-claude-code-classroom
+# from the repository root (npm workspaces)
 npm install
 
-# Navigate to project and configure
 cd project/starter
 cp .env.example .env
 ```
 
-**Local Setup:**
+Edit `.env`:
 
 ```bash
-# Clone the repository
-git clone https://github.com/udacity/cd14715-claude-code-classroom.git
-cd cd14715-claude-code-classroom/project/starter
+# Authentication - ONE of:
+ANTHROPIC_API_KEY=sk-ant-...                     # Anthropic API
+# AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION   # Bedrock
+# (In the Vocareum workspace ANTHROPIC_API_KEY is already in your environment.)
 
-# Install dependencies
-npm install
-
-# Configure environment
-cp .env.example .env
-```
-
-### Configuration
-
-Edit `.env` with your settings:
-
-**In Vocareum Workspace:**
-```bash
-# API credentials are already in your environment - don't add them here
-
-# Model Configuration (REQUIRED)
+# Required for both
 ANTHROPIC_MODEL=claude-sonnet-4-5-20250929
+# Bedrock form: us.anthropic.claude-sonnet-4-5-20250929-v1:0
 
-# Project root (REQUIRED)
-PROJECT_ROOT=/voc/work/cd14715-claude-code-classroom/project/starter
-
-# GitHub Token (RECOMMENDED for higher rate limits)
-# GITHUB_TOKEN=ghp_your-token-here
-
-# Logging level (optional)
-LOG_LEVEL=info
-```
-
-**Local Setup with Your Own API Key:**
-```bash
-# Your Anthropic API key
-ANTHROPIC_API_KEY=sk-ant-your-key-here
-
-# Model Configuration (REQUIRED)
-ANTHROPIC_MODEL=claude-sonnet-4-5-20250929
-
-# Project root (REQUIRED - update to your path)
+# Required - must contain .claude/skills/
 PROJECT_ROOT=/absolute/path/to/project/starter
 
-# GitHub Token (RECOMMENDED)
-# GITHUB_TOKEN=ghp_your-token-here
+# Recommended: raises GitHub rate limits and allows private repos
+# GITHUB_TOKEN=ghp_...
 
-# Logging level (optional)
 LOG_LEVEL=info
 ```
 
-### Running
+No credential is read from source: the GitHub token is taken from the
+environment and mapped to `GITHUB_PERSONAL_ACCESS_TOKEN`, the name the GitHub
+MCP server expects.
+
+## Usage
 
 ```bash
-# Development mode
 npm run dev -- <owner> <repo> <pr-number>
+npm run dev -- octocat Hello-World 1
 
-# Production build
-npm run build
-npm start <owner> <repo> <pr-number>
-
-# Example
-npm run dev -- facebook react 12345
+npm run build && npm start <owner> <repo> <pr-number>
 ```
 
-### Testing
+Three files are written per run:
+
+```
+reports/<owner>_<repo>_<pr>.json
+reports/<owner>_<repo>_<pr>.md
+reports/<owner>_<repo>_<pr>.html
+```
+
+Structured logs go to `logs/combined.log` and `logs/error.log`.
+
+## Testing
 
 ```bash
-# Run all tests
-npm test
-
-# Run specific test
-npm test -- orchestrator.test.ts
-
-# Watch mode
-npm test -- --watch
+npm test          # 99 tests, no API key or network required
+npm run lint      # tsc --noEmit
+npm run build
 ```
 
-## Key Technologies
+The SDK is mocked in `tests/orchestrator.test.ts`, so aggregation, summary
+recomputation, schema validation, retry, timeout and report writing are all
+covered offline. The one live integration test is `it.skip`-ped by design.
 
-- **Claude Agent SDK** - Multi-agent orchestration framework
-- **Model Context Protocol (MCP)** - External data integration
-- **Zod** - Schema validation and type safety
-- **TypeScript** - Type-safe development
-- **Vitest** - Testing framework
-- **Winston** - Structured logging
+## Implementation notes
 
-## Success Criteria
+- **Model is never hardcoded.** The orchestrator reads
+  `process.env.ANTHROPIC_MODEL`; every subagent uses `model: 'inherit'`, so one
+  value drives the whole run and the same build works against the Anthropic API
+  and Bedrock.
+- **`allowedTools` includes the subagents' tools.** It is a session-wide
+  permission filter, so listing only `Task` would block the subagents' `Read` /
+  `Grep` / `Skill` calls under any `permissionMode` stricter than
+  `bypassPermissions`. The list is derived from the agent definitions, so it
+  cannot drift.
+- **Least privilege.** No subagent has `Write`, `Edit` or `Bash`. The
+  refactoring agent proposes diffs as text; it cannot apply them.
+- **The summary is recomputed, not trusted.** After `safeParse` succeeds, the
+  five summary counters are recalculated from `fileReviews`, and `metadata`
+  is replaced with measured timings, so headline numbers cannot contradict the
+  findings beneath them.
+- **Retries are selective.** `withRetry` takes a predicate; deterministic
+  failures (schema validation, bad config, timeout) are rethrown immediately
+  with their own error code rather than re-running a full multi-agent review.
+- **The ESLint MCP tool is `lint-files`.** Verified by an `initialize` +
+  `tools/list` handshake against the server; `mcp__eslint__lint` does not exist.
 
-Your implementation is complete when:
+## Deliverable status
 
-- [ ] TypeScript compiles without errors: `npm run build`
-- [ ] All tests pass: `npm test`
-- [ ] Can review a real PR: `npm start owner repo pr-number`
-- [ ] Generates reports in at least one format (MD, HTML, JSON)
-- [ ] Rate limiting prevents API throttling (Optional)
-- [ ] Errors are handled gracefully (Recommended)
+Phases 1-5 are complete and verified: `npm run lint`, `npm run build` and
+`npm test` (99 passing) are clean, and both MCP servers complete a stdio
+handshake.
 
-## Resources
+Phase 6 is **not** complete. The nine report files for
+`airaamane/simple-todo-app` PRs 1-3 require a live Anthropic API key, which was
+not available in the environment where this was built. To produce them:
 
-- [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk)
-- [Model Context Protocol](https://modelcontextprotocol.io/)
-- [Anthropic API Docs](https://docs.anthropic.com/)
-- [Zod Documentation](https://zod.dev/)
+```bash
+npm run dev -- airaamane simple-todo-app 1
+npm run dev -- airaamane simple-todo-app 2
+npm run dev -- airaamane simple-todo-app 3
+```
 
-Good luck!
+That yields all nine files in `reports/`.

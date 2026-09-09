@@ -3,28 +3,52 @@ import * as dotenv from 'dotenv';
 // Load environment variables
 dotenv.config();
 
-import { CodeReviewOrchestrator } from './orchestrator.js';
+import { mkdir, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
-const USAGE = 'Usage: npm run dev -- <owner> <repo> <pr-number>\nExample: npm run dev -- octocat Hello-World 1';
+import { CodeReviewOrchestrator } from './orchestrator.js';
+import { ReportGenerator } from './utils/report-generator.js';
+import { formatError, isReviewError } from './utils/error-handler.js';
+import { logger } from './utils/logger.js';
+import type { ReviewReport } from './types/report-types.js';
+
+const USAGE = [
+  'Usage: npm run dev -- <owner> <repo> <pr-number>',
+  'Example: npm run dev -- octocat Hello-World 1'
+].join('\n');
+
+/** Directory the three report files are written to. */
+const REPORTS_DIR = process.env.REPORTS_DIR ?? 'reports';
 
 function fail(message: string): never {
-  console.error(`❌ ${message}`);
+  console.error(`\n❌ ${message}\n`);
   process.exit(1);
 }
 
 /**
  * Validate CLI arguments and return the parsed PR coordinates.
+ *
+ * `process.argv.slice(2)` is passed in, so argv[0] (node) and argv[1] (script)
+ * are already stripped by the caller.
  */
-function parseArgs(argv: string[]): { owner: string; repo: string; prNumber: number } {
-  const [owner, repo, prStr] = argv;
+export function parseArgs(args: string[]): {
+  owner: string;
+  repo: string;
+  prNumber: number;
+} {
+  const [owner, repo, prStr] = args;
 
   if (!owner || !repo || !prStr) {
-    fail(`Missing arguments.\n${USAGE}`);
+    fail(`Missing arguments - owner, repo and pr-number are all required.\n${USAGE}`);
   }
 
+  // Number() rejects "12abc" (NaN) where parseInt would silently accept it.
   const prNumber = Number(prStr);
   if (!Number.isInteger(prNumber) || prNumber <= 0) {
-    fail(`Invalid pull request number: "${prStr}". Expected a positive integer.\n${USAGE}`);
+    fail(
+      `Invalid pull request number: "${prStr}". Expected a positive integer.\n${USAGE}`
+    );
   }
 
   return { owner, repo, prNumber };
@@ -36,6 +60,7 @@ function parseArgs(argv: string[]): { owner: string; repo: string; prNumber: num
  */
 function validateAuth(): void {
   const hasAnthropicKey = Boolean(process.env.ANTHROPIC_API_KEY);
+  // Bedrock needs BOTH halves of the credential pair, hence AND not OR.
   const hasAwsKeys = Boolean(
     process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY
   );
@@ -78,6 +103,39 @@ function validateModel(): string {
 }
 
 /**
+ * Write the Markdown, HTML and JSON reports for one PR.
+ *
+ * Filenames follow `<owner>_<repo>_<pr>.<ext>` so the nine submission files
+ * sort together by PR.
+ */
+export async function writeReports(
+  report: ReviewReport,
+  owner: string,
+  repo: string,
+  prNumber: number,
+  reportsDir: string = REPORTS_DIR
+): Promise<string[]> {
+  const generator = new ReportGenerator();
+  await mkdir(reportsDir, { recursive: true });
+
+  const base = `${owner}_${repo}_${prNumber}`;
+  const outputs: Array<{ file: string; body: string }> = [
+    { file: `${base}.json`, body: generator.generateJSONReport(report) },
+    { file: `${base}.md`, body: generator.generateMarkdownReport(report) },
+    { file: `${base}.html`, body: generator.generateHTMLReport(report) }
+  ];
+
+  const written: string[] = [];
+  for (const { file, body } of outputs) {
+    const target = path.join(reportsDir, file);
+    await writeFile(target, body, 'utf-8');
+    written.push(target);
+  }
+
+  return written;
+}
+
+/**
  * Main entry point for the Claude Multi-Agent Code Review System
  * Usage: npm run dev <owner> <repo> <pr-number>
  */
@@ -87,20 +145,56 @@ async function main() {
   validateAuth();
   const model = validateModel();
 
-  console.log(`🔍 Reviewing ${owner}/${repo}#${prNumber} with ${model}\n`);
+  console.log(`🔍 Reviewing ${owner}/${repo}#${prNumber}`);
+  console.log(`🤖 Model: ${model}\n`);
+
+  const startedAt = Date.now();
 
   try {
     const orchestrator = new CodeReviewOrchestrator();
     const report = await orchestrator.reviewPullRequest(owner, repo, prNumber);
 
-    console.log(JSON.stringify(report, null, 2));
+    const written = await writeReports(report, owner, repo, prNumber);
 
-    // TODO (Part 2): render the report with ReportGenerator and write
-    // Markdown, HTML and JSON files into reports/.
+    const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+    console.log(`\n✅ Review complete in ${elapsed}s`);
+    console.log(`   Overall score : ${report.summary.overallScore}/100`);
+    console.log(`   Files reviewed: ${report.summary.totalFiles}`);
+    console.log(`   Critical issues: ${report.summary.criticalIssues}`);
+    console.log(`   Tests needed   : ${report.summary.highPriorityTests}`);
+    console.log(`   Refactorings   : ${report.summary.refactoringOpportunities}`);
+    console.log('\n📄 Reports written:');
+    for (const file of written) {
+      console.log(`   ${file}`);
+    }
   } catch (error) {
-    console.error('Error:', error instanceof Error ? error.message : error);
-    process.exit(1);
+    // Report the problem, not a stack trace. The full error (with stack) is in
+    // logs/error.log for debugging.
+    logger.error('Review failed', { owner, repo, prNumber, error });
+
+    const detail = isReviewError(error)
+      ? `${formatError(error)}\n   ${JSON.stringify(error.metadata ?? {})}`
+      : formatError(error);
+
+    fail(
+      `Review of ${owner}/${repo}#${prNumber} failed.\n   ${detail}\n\n` +
+        'Common causes:\n' +
+        '  - GITHUB_TOKEN missing or lacking access to a private repo\n' +
+        '  - the PR number does not exist in that repository\n' +
+        '  - npx unavailable, so an MCP server could not start\n' +
+        'See logs/error.log for the full stack trace.'
+    );
   }
 }
 
-main();
+/**
+ * Only run when this file is the process entry point, so tests can import
+ * `parseArgs` and `writeReports` without triggering a review or process.exit.
+ */
+const invokedDirectly =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (invokedDirectly) {
+  await main();
+}
