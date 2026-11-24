@@ -19,6 +19,6 @@ export const refactoringSuggester: AgentDefinition = {
   description:
     'Identifies behavior-preserving refactorings for a single source file - extract-function, rename, modernize, simplify and pattern improvements - each with verbatim before/after code and its benefit. Use this agent whenever you need to know how a file could be RESTRUCTURED, as opposed to what is broken in it. Invoke it once per file with the file path, owner/repo/ref and the file patch.',
   prompt: REFACTORING_SUGGESTER_PROMPT,
-  tools: ['Read', 'Grep', 'Glob', 'mcp__github__get_file_contents'],
+  tools: ['Read', 'Grep', 'Glob', 'Skill','mcp__github__get_file_contents'],
   model: 'inherit'
 };
